@@ -1,0 +1,54 @@
+name: Build Kaming OS ISO
+
+on:
+  workflow_dispatch:   # запуск кнопкой "Run workflow"
+  push:
+    branches: [main]
+    paths:
+      - build-kaming-os.sh
+      - .github/workflows/build.yml
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Забрать файлы репозитория
+        uses: actions/checkout@v4
+
+      - name: Освободить место на диске (ISO большой)
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Собрать ISO внутри чистого Debian 13
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD":/work -w /work \
+            debian:trixie \
+            bash /work/build-kaming-os.sh
+
+      - name: Показать результат
+        run: |
+          ls -lh kaming-os.iso
+          sha256sum kaming-os.iso | tee kaming-os.iso.sha256
+
+      - name: Выложить ISO для скачивания
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaming-os-iso
+          path: |
+            kaming-os.iso
+            kaming-os.iso.sha256
+          compression-level: 0
+          retention-days: 7
+
+      - name: Выложить лог сборки (если что-то пошло не так)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: kaming-build/build.log
+          if-no-files-found: ignore
+          retention-days: 7
