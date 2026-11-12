@@ -75,7 +75,6 @@ winetricks
 # Работа в виртуалках (VirtualBox, VMware, QEMU/KVM)
 open-vm-tools
 open-vm-tools-desktop
-virtualbox-guest-x11
 spice-vdagent
 qemu-guest-agent
 # Установка на реальный компьютер
