@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Kaming OS 1.1 - сборщик ISO (Debian 13 "trixie" + XFCE в стиле macOS)
+# Kaming OS 1.2 - сборщик ISO (Debian 13 "trixie" + XFCE в стиле macOS)
 # Внутри: свой браузер, свои настройки (обои, темы, док, языки), Wine для .exe.
 # Запускается GitHub Actions (build.yml) или вручную на Debian/Ubuntu (нужен root).
 set -euo pipefail
@@ -9,7 +9,7 @@ if [ "$EUID" -ne 0 ]; then exec sudo bash "$0" "$@"; fi
 echo "==> Установка инструментов сборки"
 apt-get update
 apt-get install -y live-build debootstrap xorriso squashfs-tools mtools dosfstools \
-  grub-pc-bin grub-efi-amd64-bin imagemagick curl ca-certificates
+  grub-pc-bin grub-efi-amd64-bin imagemagick curl ca-certificates xz-utils
 
 WORK="$(pwd)/kaming-build"
 mkdir -p "$WORK"
@@ -175,6 +175,16 @@ div{{text-align:center;max-width:560px;padding:20px}}h1{{font-weight:600}}p{{opa
 
 
 # ---------- загрузки ----------
+DOWNLOADS = []  # {"name","path","progress","done","failed"}
+
+
+def notify(msg):
+    try:
+        subprocess.Popen(["notify-send", "-i", "folder-download", "Kaming Browser", msg])
+    except Exception:
+        pass
+
+
 def unique_path(path):
     base, ext = os.path.splitext(path)
     n = 1
@@ -184,27 +194,49 @@ def unique_path(path):
     return path
 
 
-def on_decide_destination(download, suggested):
-    folder = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) or os.path.expanduser("~/Downloads")
-    os.makedirs(folder, exist_ok=True)
-    name = os.path.basename(suggested or "download") or "download"
-    path = unique_path(os.path.join(folder, name))
-    download.set_destination(GLib.filename_to_uri(path, None))
-    return True
-
-
-def on_download_finished(download):
-    dest = download.get_destination() or ""
-    name = os.path.basename(urllib.parse.unquote(dest))
-    try:
-        subprocess.Popen(["notify-send", "Kaming Browser", f"{t('downloaded')}: {name}"])
-    except Exception:
-        pass
+def refresh_downloads_ui():
+    for w in list(WINDOWS):
+        GLib.timeout_add(400, w.refresh_downloads)
 
 
 def on_download_started(ctx, download):
-    download.connect("decide-destination", on_decide_destination)
-    download.connect("finished", on_download_finished)
+    try:
+        guess = os.path.basename(urllib.parse.unquote((download.get_request().get_uri() or "").split("?")[0]))
+    except Exception:
+        guess = ""
+    item = {"name": guess or "download", "path": None, "progress": 0.0, "done": False, "failed": False}
+    DOWNLOADS.append(item)
+    del DOWNLOADS[:-30]
+
+    def decide(d, suggested):
+        folder = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) or os.path.expanduser("~/Downloads")
+        os.makedirs(folder, exist_ok=True)
+        name = os.path.basename(suggested or item["name"]) or "download"
+        path = unique_path(os.path.join(folder, name))
+        item["name"], item["path"] = os.path.basename(path), path
+        d.set_destination(GLib.filename_to_uri(path, None))
+        notify(f"{t('download_started')}: {item['name']}")
+        refresh_downloads_ui()
+        return True
+
+    def progress(d, _p):
+        item["progress"] = d.get_estimated_progress()
+
+    def finished(d):
+        if not item["failed"]:
+            item["done"], item["progress"] = True, 1.0
+            notify(f"{t('downloaded')}: {item['name']}")
+        refresh_downloads_ui()
+
+    def failed(d, err):
+        item["failed"] = True
+        notify(f"{t('download_failed')}: {item['name']}")
+
+    download.connect("decide-destination", decide)
+    download.connect("notify::estimated-progress", progress)
+    download.connect("finished", finished)
+    download.connect("failed", failed)
+    refresh_downloads_ui()
 
 
 _PRIVATE_CTX = None
@@ -256,7 +288,10 @@ class BrowserWindow(Gtk.Window):
         self.btn_new = self._icon_button("tab-new-symbolic", lambda *_: self.new_tab(None, focus_entry=True))
         self.btn_star = self._icon_button("non-starred-symbolic", self.on_star)
         self.btn_reload = self._icon_button("view-refresh-symbolic", self.on_reload)
-        for b in (self.btn_menu, self.btn_new, self.btn_star, self.btn_reload):
+        self.btn_dl = self._icon_button("document-save-symbolic", self.on_dl_click)
+        self.btn_dl.set_no_show_all(True)
+        self.pop = Gtk.Popover.new(self.btn_dl)
+        for b in (self.btn_menu, self.btn_new, self.btn_dl, self.btn_star, self.btn_reload):
             hb.pack_end(b)
 
         if private:
@@ -543,6 +578,52 @@ class BrowserWindow(Gtk.Window):
             return True
         return False
 
+    # ----- загрузки -----
+    def refresh_downloads(self):
+        active = [d for d in DOWNLOADS if not d["done"] and not d["failed"]]
+        self.btn_dl.set_visible(bool(DOWNLOADS))
+        tip = t("downloads")
+        if active:
+            tip += f": {int(active[-1]['progress'] * 100)}%"
+        self.btn_dl.set_tooltip_text(tip)
+        if self.pop.get_visible():
+            self.build_pop()
+        return bool(active)
+
+    def build_pop(self):
+        for c in self.pop.get_children():
+            self.pop.remove(c)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_size_request(330, -1)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(box, f"set_margin_{m}")(12)
+        if not DOWNLOADS:
+            box.pack_start(Gtk.Label(label=t("dl_empty")), False, False, 0)
+        for d in reversed(DOWNLOADS[-8:]):
+            row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            lab = Gtk.Label(label=d["name"], xalign=0)
+            lab.set_ellipsize(3)
+            lab.set_max_width_chars(42)
+            row.pack_start(lab, False, False, 0)
+            if d["failed"]:
+                row.pack_start(Gtk.Label(label=t("download_failed"), xalign=0), False, False, 0)
+            elif d["done"]:
+                bt = Gtk.Button(label=t("show_folder"))
+                bt.set_halign(Gtk.Align.START)
+                bt.connect("clicked", lambda _b, p=d["path"]: p and subprocess.Popen(["xdg-open", os.path.dirname(p)]))
+                row.pack_start(bt, False, False, 0)
+            else:
+                pb = Gtk.ProgressBar()
+                pb.set_fraction(d["progress"])
+                row.pack_start(pb, False, False, 0)
+            box.pack_start(row, False, False, 0)
+        box.show_all()
+        self.pop.add(box)
+
+    def on_dl_click(self, *_):
+        self.build_pop()
+        self.pop.popup()
+
     # ----- меню -----
     def on_menu(self, btn):
         menu = Gtk.Menu()
@@ -590,6 +671,13 @@ class BrowserWindow(Gtk.Window):
         menu.append(hm)
         menu.append(Gtk.SeparatorMenuItem())
 
+        def in_firefox():
+            v = self.cur_view()
+            uri = v.get_uri() if v else None
+            if uri and not uri.startswith("kaming://"):
+                subprocess.Popen(["firefox-esr", uri])
+
+        item(t("open_firefox"), in_firefox)
         item(t("find"), self.open_find)
         item(t("zoom_in"), lambda: self.zoom(0.1))
         item(t("zoom_out"), lambda: self.zoom(-0.1))
@@ -662,6 +750,7 @@ cat > "config/includes.chroot/usr/local/bin/kaming-settings" <<'KAMING_EOF_1'
 import glob
 import os
 import platform
+import re
 import subprocess
 import sys
 
@@ -728,13 +817,16 @@ def set_theme(dark):
 
 
 def set_wallpaper(path):
+    output, _modes = xrandr_info()
+    names = ["monitor0"] + (["monitor" + output] if output else [])
     props = run(["xfconf-query", "-c", "xfce4-desktop", "-l"]).stdout.split()
-    targets = [p for p in props if p.endswith("/last-image")]
-    if not targets:
-        targets = [f"/backdrop/screen0/{m}/workspace0/last-image" for m in ("monitor0", "monitorVirtual-1", "monitorVirtual1")]
-    for p in targets:
+    targets = {p for p in props if p.endswith("/last-image")}
+    for n in names:
+        targets.add(f"/backdrop/screen0/{n}/workspace0/last-image")
+    for p in sorted(targets):
         xf("xfce4-desktop", p, "string", path)
         xf("xfce4-desktop", p.replace("last-image", "image-style"), "int", 5)
+    run(["xfdesktop", "--reload"])
 
 
 def xrandr_info():
@@ -792,6 +884,8 @@ class Settings(Gtk.Window):
             ("display", self.page_display),
             ("language", self.page_language),
             ("keyboard", self.page_keyboard),
+            ("sound", self.page_sound),
+            ("users", self.page_users),
             ("windows_apps", self.page_windows),
             ("performance", self.page_performance),
             ("system", self.page_system),
@@ -907,22 +1001,51 @@ class Settings(Gtk.Window):
     def page_display(self):
         p = self.new_page(t("display"))
         output, modes = xrandr_info()
-        if output and modes:
-            combo = Gtk.ComboBoxText()
-            for m in modes:
-                combo.append(m, m)
+        presets = ["1024x768", "1280x720", "1280x800", "1366x768", "1440x900", "1600x900",
+                   "1680x1050", "1920x1080", "1920x1200", "2560x1440", "3840x2160"]
+        if output:
+            combo = Gtk.ComboBoxText.new_with_entry()
+            for m in modes + [m for m in presets if m not in modes]:
+                combo.append_text(m)
             combo.set_active(0)
             p.pack_start(self.row(t("resolution"), combo), False, False, 0)
+            p.pack_start(self.note(t("res_hint")), False, False, 0)
             btn = Gtk.Button(label=t("apply"))
-            btn.connect("clicked", lambda *_: run(["xrandr", "--output", output, "--mode", combo.get_active_id()]))
+            btn.connect("clicked", lambda *_: self.apply_resolution(output, combo.get_active_text() or ""))
             p.pack_start(btn, False, False, 0)
         sc = Gtk.ComboBoxText()
         for pct, dpi in (("100%", 96), ("125%", 120), ("150%", 144), ("200%", 192)):
             sc.append(str(dpi), pct)
-        sc.set_active_id(xf_get("xsettings", "/Xft/DPI") if xf_get("xsettings", "/Xft/DPI") in ("96", "120", "144", "192") else "96")
+        cur = xf_get("xsettings", "/Xft/DPI")
+        sc.set_active_id(cur if cur in ("96", "120", "144", "192") else "96")
         sc.connect("changed", lambda c: xf("xsettings", "/Xft/DPI", "int", c.get_active_id()))
         p.pack_start(self.row(t("scale"), sc), False, False, 0)
         return p
+
+    def apply_resolution(self, output, text):
+        m = re.match(r"^\s*(\d{3,5})\s*[x×]\s*(\d{3,5})", text)
+        if not m:
+            return
+        w, h = int(m.group(1)), int(m.group(2))
+        name = f"{w}x{h}"
+        if name not in xrandr_info()[1]:
+            cvt = run(["cvt", str(w), str(h)]).stdout
+            line = [ln for ln in cvt.splitlines() if ln.startswith("Modeline")]
+            if line:
+                parts = line[0].split()
+                name = parts[1].strip('"')
+                run(["xrandr", "--newmode", name] + parts[2:])
+                run(["xrandr", "--addmode", output, name])
+        r = run(["xrandr", "--output", output, "--mode", name])
+        if r.returncode != 0:
+            self.show_error(r.stderr or "xrandr failed")
+
+    def show_error(self, text):
+        d = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.ERROR,
+                              buttons=Gtk.ButtonsType.CLOSE, text=t("error"))
+        d.format_secondary_text(text[:400])
+        d.run()
+        d.destroy()
 
     def page_language(self):
         p = self.new_page(t("language"))
@@ -938,9 +1061,27 @@ class Settings(Gtk.Window):
         return p
 
     def apply_language(self, code):
-        I.set_lang(code)
-        run(["sudo", "-n", "/usr/local/sbin/kaming-set-locale", I.LANGS[code][1]])
-        os.execv(sys.executable, [sys.executable] + sys.argv)  # перезапуск окна на новом языке
+        ok = I.apply_language(code)
+        os.makedirs(os.path.expanduser("~/.config/kaming"), exist_ok=True)
+        with open(os.path.expanduser("~/.config/kaming/ask-logout"), "w") as f:
+            f.write("ok" if ok else "partial")
+        os.execv(sys.executable, [sys.executable] + sys.argv)  # окно перезапускается на новом языке
+
+    def maybe_ask_logout(self):
+        flag = os.path.expanduser("~/.config/kaming/ask-logout")
+        if not os.path.exists(flag):
+            return False
+        partial = open(flag).read().strip() == "partial"
+        os.remove(flag)
+        d = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.QUESTION,
+                              buttons=Gtk.ButtonsType.NONE, text=t("logout_now"))
+        if partial:
+            d.format_secondary_text(t("lang_sys_fail"))
+        d.add_buttons(t("later"), Gtk.ResponseType.NO, t("log_out"), Gtk.ResponseType.YES)
+        if d.run() == Gtk.ResponseType.YES:
+            spawn(["xfce4-session-logout", "--logout"])
+        d.destroy()
+        return False
 
     def page_keyboard(self):
         p = self.new_page(t("keyboard"))
@@ -991,10 +1132,7 @@ class Settings(Gtk.Window):
         dlg.add_filter(flt)
         if dlg.run() == Gtk.ResponseType.OK:
             path = dlg.get_filename()
-            if path.lower().endswith(".msi"):
-                spawn(["wine", "msiexec", "/i", path])
-            else:
-                spawn(["wine", "start", "/unix", path])
+            spawn(["kaming-run-windows", path])
         dlg.destroy()
 
     def page_performance(self):
@@ -1029,10 +1167,53 @@ class Settings(Gtk.Window):
         except Exception:
             return False
 
+    def page_sound(self):
+        p = self.new_page(t("sound"))
+        m = re.search(r"(\d+)%", run(["pactl", "get-sink-volume", "@DEFAULT_SINK@"]).stdout)
+        vol = int(m.group(1)) if m else 80
+        sc = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        sc.set_value(min(vol, 100))
+        sc.set_size_request(280, -1)
+        sc.connect("value-changed", lambda s_: run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{int(s_.get_value())}%"]))
+        p.pack_start(self.row(t("volume"), sc), False, False, 0)
+        mute = Gtk.Switch()
+        mute.set_active("yes" in run(["pactl", "get-sink-mute", "@DEFAULT_SINK@"]).stdout)
+        mute.connect("notify::active", lambda s_, _p: run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "1" if s_.get_active() else "0"]))
+        p.pack_start(self.row(t("mute"), mute), False, False, 0)
+        b = Gtk.Button(label=t("mixer"))
+        b.connect("clicked", lambda *_: spawn(["pavucontrol"]))
+        p.pack_start(b, False, False, 0)
+        return p
+
+    def page_users(self):
+        p = self.new_page(t("users"))
+        grid = Gtk.Grid(column_spacing=24, row_spacing=8)
+        for i, (k, v) in enumerate(((t("full_name"), GLib.get_real_name() or "-"), (t("username"), GLib.get_user_name()))):
+            grid.attach(Gtk.Label(label=k, xalign=0), 0, i, 1, 1)
+            grid.attach(Gtk.Label(label=v, xalign=0), 1, i, 1, 1)
+        p.pack_start(grid, False, False, 0)
+        b = Gtk.Button(label=t("change_password"))
+        b.connect("clicked", lambda *_: spawn(["xfce4-terminal", "-x", "passwd"]))
+        p.pack_start(b, False, False, 0)
+        entry = Gtk.Entry()
+        entry.set_placeholder_text(t("new_name"))
+        b2 = Gtk.Button(label=t("change_name"))
+        b2.connect("clicked", lambda *_: entry.get_text().strip() and spawn(["xfce4-terminal", "-x", "chfn", "-f", entry.get_text().strip()]))
+        r = Gtk.Box(spacing=8)
+        r.pack_start(entry, True, True, 0)
+        r.pack_start(b2, False, False, 0)
+        p.pack_start(r, False, False, 0)
+        b3 = Gtk.Button(label=t("lock_screen"))
+        b3.connect("clicked", lambda *_: spawn(["xflock4"]))
+        b4 = Gtk.Button(label=t("log_out"))
+        b4.connect("clicked", lambda *_: spawn(["xfce4-session-logout", "--logout"]))
+        p.pack_start(b3, False, False, 0)
+        p.pack_start(b4, False, False, 0)
+        return p
+
     def page_system(self):
         p = self.new_page(t("system"))
         for key, cmd in (("network", ["nm-connection-editor"]),
-                         ("sound", ["pavucontrol"]),
                          ("power", ["xfce4-power-manager-settings"])):
             b = Gtk.Button(label=t(key))
             b.connect("clicked", lambda _b, c=cmd: spawn(c))
@@ -1053,7 +1234,7 @@ class Settings(Gtk.Window):
             up = "?"
         virt = run(["systemd-detect-virt"]).stdout.strip() or "none"
         info = [
-            (t("version"), "Kaming OS 1.1"),
+            (t("version"), "Kaming OS 1.2"),
             (t("kernel"), platform.release()),
             (t("processor"), read_first("/proc/cpuinfo", "model name")),
             (t("memory"), mem_gb),
@@ -1076,6 +1257,7 @@ def main():
     win = Settings()
     win.connect("destroy", Gtk.main_quit)
     win.show_all()
+    GLib.idle_add(win.maybe_ask_logout)
     Gtk.main()
 
 
@@ -1089,6 +1271,8 @@ cat > "config/includes.chroot/usr/local/lib/kaming/kaming_i18n.py" <<'KAMING_EOF
 """Kaming OS: общие переводы для программ Kaming (en, ru, uk, zh, pl)."""
 import json
 import os
+import re
+import subprocess
 
 LANGS = {
     "en": ("English", "en_US.UTF-8"),
@@ -1238,6 +1422,74 @@ S = {
     "load_failed": ("Can't open this page", "Не удаётся открыть страницу", "Не вдається відкрити сторінку", "无法打开此页面", "Nie można otworzyć strony"),
     "check_connection": ("Check the address and your internet connection.", "Проверьте адрес и подключение к интернету.", "Перевірте адресу та підключення до інтернету.", "请检查网址和网络连接。", "Sprawdź adres i połączenie z internetem."),
     "close_tab": ("Close tab", "Закрыть вкладку", "Закрити вкладку", "关闭标签页", "Zamknij kartę"),
+
+    # --- v1.2 ---
+    "users": ("Users", "Пользователи", "Користувачі", "用户", "Użytkownicy"),
+    "full_name": ("Full name", "Полное имя", "Повне ім'я", "全名", "Imię i nazwisko"),
+    "username": ("Username", "Имя пользователя", "Ім'я користувача", "用户名", "Nazwa użytkownika"),
+    "change_password": ("Change password…", "Сменить пароль…", "Змінити пароль…", "修改密码…", "Zmień hasło…"),
+    "change_name": ("Change full name", "Изменить полное имя", "Змінити повне ім'я", "修改全名", "Zmień imię i nazwisko"),
+    "new_name": ("New full name", "Новое полное имя", "Нове повне ім'я", "新的全名", "Nowe imię i nazwisko"),
+    "lock_screen": ("Lock screen", "Заблокировать экран", "Заблокувати екран", "锁定屏幕", "Zablokuj ekran"),
+    "log_out": ("Log out", "Выйти", "Вийти", "注销", "Wyloguj"),
+    "logout_now": (
+        "Log out now so the new language applies everywhere?",
+        "Выйти сейчас, чтобы новый язык применился везде?",
+        "Вийти зараз, щоб нова мова застосувалася всюди?",
+        "现在注销以使新语言在所有程序中生效？",
+        "Wylogować teraz, aby nowy język działał wszędzie?",
+    ),
+    "later": ("Later", "Позже", "Пізніше", "稍后", "Później"),
+    "volume": ("Volume", "Громкость", "Гучність", "音量", "Głośność"),
+    "mute": ("Mute", "Без звука", "Без звуку", "静音", "Wycisz"),
+    "mixer": ("Sound mixer…", "Микшер звука…", "Мікшер звуку…", "音频混音器…", "Mikser dźwięku…"),
+    "res_hint": (
+        "Pick a resolution or type your own, e.g. 1920x1080",
+        "Выберите разрешение или введите своё, например 1920x1080",
+        "Оберіть роздільну здатність або введіть свою, наприклад 1920x1080",
+        "选择分辨率或输入自定义值，例如 1920x1080",
+        "Wybierz rozdzielczość lub wpisz własną, np. 1920x1080",
+    ),
+    "error": ("Error", "Ошибка", "Помилка", "错误", "Błąd"),
+    "lang_sys_fail": (
+        "Could not change the system-wide language, but your personal language was set.",
+        "Не удалось изменить язык системы целиком, но ваш личный язык установлен.",
+        "Не вдалося змінити мову всієї системи, але вашу особисту мову встановлено.",
+        "无法更改系统全局语言，但已设置您的个人语言。",
+        "Nie udało się zmienić języka całego systemu, ale ustawiono Twój język.",
+    ),
+    "downloads": ("Downloads", "Загрузки", "Завантаження", "下载", "Pobrane"),
+    "download_started": ("Download started", "Скачивание началось", "Завантаження розпочато", "开始下载", "Rozpoczęto pobieranie"),
+    "download_failed": ("Download failed", "Не удалось скачать", "Не вдалося завантажити", "下载失败", "Pobieranie nie powiodło się"),
+    "show_folder": ("Show in folder", "Показать в папке", "Показати в теці", "在文件夹中显示", "Pokaż w folderze"),
+    "open_firefox": ("Open in Firefox", "Открыть в Firefox", "Відкрити у Firefox", "在 Firefox 中打开", "Otwórz w Firefox"),
+    "dl_empty": ("No downloads yet", "Загрузок пока нет", "Завантажень ще немає", "暂无下载", "Brak pobrań"),
+    "welcome_title": ("Welcome to Kaming OS", "Добро пожаловать в Kaming OS", "Ласкаво просимо до Kaming OS", "欢迎使用 Kaming OS", "Witaj w Kaming OS"),
+    "choose_language": ("Choose your language", "Выберите язык", "Оберіть мову", "选择语言", "Wybierz język"),
+    "next": ("Next", "Далее", "Далі", "下一步", "Dalej"),
+    "back": ("Back", "Назад", "Назад", "返回", "Wstecz"),
+    "start": ("Get started", "Начать работу", "Почати роботу", "开始使用", "Zaczynajmy"),
+    "profile": ("Your profile", "Ваш профиль", "Ваш профіль", "您的账户", "Twój profil"),
+    "your_name": ("Your name", "Ваше имя", "Ваше ім'я", "您的姓名", "Twoje imię"),
+    "password": ("Password", "Пароль", "Пароль", "密码", "Hasło"),
+    "password_again": ("Repeat password", "Повторите пароль", "Повторіть пароль", "重复密码", "Powtórz hasło"),
+    "pw_mismatch": ("Passwords do not match", "Пароли не совпадают", "Паролі не збігаються", "两次密码不一致", "Hasła nie są takie same"),
+    "profile_note": (
+        "This is a live session: the account is temporary. Install Kaming OS to create your permanent account (name, username, password) and keep your files.",
+        "Это live-сессия: аккаунт временный. Установите Kaming OS, чтобы создать постоянный аккаунт (имя, логин, пароль) и сохранять файлы.",
+        "Це live-сесія: обліковий запис тимчасовий. Встановіть Kaming OS, щоб створити постійний обліковий запис (ім'я, логін, пароль) і зберігати файли.",
+        "这是 live 会话：账户是临时的。安装 Kaming OS 以创建永久账户（姓名、用户名、密码）并保存文件。",
+        "To sesja live: konto jest tymczasowe. Zainstaluj Kaming OS, aby utworzyć stałe konto (imię, login, hasło) i zachować pliki.",
+    ),
+    "look_title": ("Choose your look", "Выберите оформление", "Оберіть оформлення", "选择外观", "Wybierz wygląd"),
+    "open_settings": ("More in Settings…", "Больше в настройках…", "Більше в налаштуваннях…", "在设置中查看更多…", "Więcej w Ustawieniach…"),
+    "finish_text": (
+        "All set! Tip: press Ctrl+Alt+L to lock the screen.",
+        "Готово! Совет: Ctrl+Alt+L блокирует экран.",
+        "Готово! Порада: Ctrl+Alt+L блокує екран.",
+        "一切就绪！提示：按 Ctrl+Alt+L 可锁定屏幕。",
+        "Gotowe! Wskazówka: Ctrl+Alt+L blokuje ekran.",
+    ),
 }
 
 
@@ -1246,6 +1498,31 @@ def t(key):
     if not row:
         return key
     return row[ORDER.index(_lang)]
+
+
+_MB, _ME = "# >>> kaming-language", "# <<< kaming-language"
+
+
+def apply_language(code):
+    """Личный язык (~/.xsessionrc, работает без root) + язык системы (через sudo-помощник).
+    Возвращает True, если системный язык тоже изменён."""
+    set_lang(code)
+    loc = LANGS[code][1]
+    path = os.path.expanduser("~/.xsessionrc")
+    try:
+        old = open(path, encoding="utf-8").read()
+    except Exception:
+        old = ""
+    old = re.sub(re.escape(_MB) + r".*?" + re.escape(_ME) + r"\n?", "", old, flags=re.S)
+    block = f"{_MB}\nexport LANG={loc}\nexport LANGUAGE={loc.split('.')[0]}:{code}\n{_ME}\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(old + block)
+    try:
+        r = subprocess.run(["sudo", "-n", "/usr/local/sbin/kaming-set-locale", loc],
+                           capture_output=True, text=True, timeout=30)
+        return r.returncode == 0
+    except Exception:
+        return False
 KAMING_EOF_2
 chmod 644 "config/includes.chroot/usr/local/lib/kaming/kaming_i18n.py"
 
@@ -1261,14 +1538,311 @@ update-locale LANG="$1" LANGUAGE="${1%%.*}:${1%%_*}"
 KAMING_EOF_3
 chmod 755 "config/includes.chroot/usr/local/sbin/kaming-set-locale"
 
-mkdir -p "$(dirname "config/includes.chroot/etc/sudoers.d/kaming-settings")"
-cat > "config/includes.chroot/etc/sudoers.d/kaming-settings" <<'KAMING_EOF_4'
-%sudo ALL=(root) NOPASSWD: /usr/local/sbin/kaming-set-locale
+mkdir -p "$(dirname "config/includes.chroot/usr/local/sbin/kaming-live-profile")"
+cat > "config/includes.chroot/usr/local/sbin/kaming-live-profile" <<'KAMING_EOF_4'
+#!/bin/bash
+# Только для live-режима: имя и пароль текущего пользователя (строка 1 - имя, строка 2 - пароль).
+grep -q 'boot=live' /proc/cmdline || { echo "live mode only" >&2; exit 1; }
+u="${SUDO_USER:-}"
+[ -n "$u" ] || { echo "no user" >&2; exit 1; }
+IFS= read -r name
+IFS= read -r pass
+case "$name" in *:*|*,*|*=*) echo "bad characters in name" >&2; exit 1;; esac
+[ -n "$name" ] && usermod -c "$name" "$u"
+[ -n "$pass" ] && echo "$u:$pass" | chpasswd
+exit 0
 KAMING_EOF_4
+chmod 755 "config/includes.chroot/usr/local/sbin/kaming-live-profile"
+
+mkdir -p "$(dirname "config/includes.chroot/etc/sudoers.d/kaming-settings")"
+cat > "config/includes.chroot/etc/sudoers.d/kaming-settings" <<'KAMING_EOF_5'
+%sudo ALL=(root) NOPASSWD: /usr/local/sbin/kaming-set-locale, /usr/local/sbin/kaming-live-profile
+KAMING_EOF_5
 chmod 440 "config/includes.chroot/etc/sudoers.d/kaming-settings"
 
+mkdir -p "$(dirname "config/includes.chroot/usr/local/bin/kaming-welcome")"
+cat > "config/includes.chroot/usr/local/bin/kaming-welcome" <<'KAMING_EOF_6'
+#!/usr/bin/env python3
+"""Kaming Welcome: мастер первого запуска (язык, профиль, оформление, установка)."""
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, "/usr/local/lib/kaming")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import GLib, Gtk  # noqa: E402
+
+import kaming_i18n as I  # noqa: E402
+from kaming_i18n import t  # noqa: E402
+
+DONE = os.path.expanduser("~/.config/kaming/welcome-done")
+
+
+def is_live():
+    try:
+        return "boot=live" in open("/proc/cmdline").read()
+    except Exception:
+        return False
+
+
+def xf(channel, prop, val):
+    subprocess.run(["xfconf-query", "-c", channel, "-p", prop, "--create", "-t", "string", "-s", val],
+                   capture_output=True)
+
+
+class Welcome(Gtk.Window):
+    def __init__(self, step=0):
+        super().__init__(title=t("welcome_title"))
+        self.set_default_size(560, 420)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        self.live = is_live()
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(outer, f"set_margin_{m}")(24)
+        self.add(outer)
+
+        title = Gtk.Label()
+        title.set_markup(f"<span size='xx-large' weight='bold'>{GLib.markup_escape_text(t('welcome_title'))}</span>")
+        outer.pack_start(title, False, False, 0)
+
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        outer.pack_start(self.stack, True, True, 0)
+
+        self.steps = ["lang"] + (["profile"] if self.live else []) + ["look", "finish"]
+        builders = {"lang": self.page_lang, "profile": self.page_profile, "look": self.page_look, "finish": self.page_finish}
+        for name in self.steps:
+            self.stack.add_named(builders[name](), name)
+
+        nav = Gtk.Box(spacing=8)
+        self.btn_back = Gtk.Button(label=t("back"))
+        self.btn_next = Gtk.Button(label=t("next"))
+        self.btn_next.get_style_context().add_class("suggested-action")
+        self.btn_back.connect("clicked", lambda *_: self.go(-1))
+        self.btn_next.connect("clicked", lambda *_: self.go(1))
+        nav.pack_start(self.btn_back, False, False, 0)
+        nav.pack_end(self.btn_next, False, False, 0)
+        outer.pack_start(nav, False, False, 0)
+        self.idx = min(step, len(self.steps) - 1)
+        self.show_all()
+        self.update()
+
+    def center(self, widgets):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_valign(Gtk.Align.CENTER)
+        for w in widgets:
+            box.pack_start(w, False, False, 0)
+        return box
+
+    def note(self, text):
+        lab = Gtk.Label(label=text)
+        lab.set_line_wrap(True)
+        lab.set_max_width_chars(60)
+        return lab
+
+    def page_lang(self):
+        self.lang_combo = Gtk.ComboBoxText()
+        for code in I.ORDER:
+            self.lang_combo.append(code, I.LANGS[code][0])
+        self.lang_combo.set_active_id(I.get_lang())
+        return self.center([self.note(t("choose_language")), self.lang_combo])
+
+    def page_profile(self):
+        self.e_name, self.e_pw, self.e_pw2 = Gtk.Entry(), Gtk.Entry(), Gtk.Entry()
+        self.e_name.set_placeholder_text(t("your_name"))
+        for e, ph in ((self.e_pw, t("password")), (self.e_pw2, t("password_again"))):
+            e.set_visibility(False)
+            e.set_placeholder_text(ph)
+        return self.center([self.e_name, self.e_pw, self.e_pw2, self.note(t("profile_note"))])
+
+    def page_look(self):
+        combo = Gtk.ComboBoxText()
+        combo.append("light", t("light"))
+        combo.append("dark", t("dark"))
+        combo.set_active_id("light")
+
+        def set_theme(c):
+            dark = c.get_active_id() == "dark"
+            name = "WhiteSur-Dark" if dark else "WhiteSur-Light"
+            xf("xsettings", "/Net/ThemeName", name)
+            xf("xsettings", "/Net/IconThemeName", "WhiteSur-dark" if dark else "WhiteSur")
+            xf("xfwm4", "/general/theme", name)
+
+        combo.connect("changed", set_theme)
+        more = Gtk.Button(label=t("open_settings"))
+        more.connect("clicked", lambda *_: subprocess.Popen(["kaming-settings"]))
+        return self.center([self.note(t("look_title")), combo, more])
+
+    def page_finish(self):
+        widgets = [self.note(t("finish_text"))]
+        if self.live:
+            b = Gtk.Button(label=t("install_now"))
+            b.connect("clicked", lambda *_: subprocess.Popen(["sudo", "-E", "calamares"]))
+            widgets.append(b)
+        return self.center(widgets)
+
+    def update(self):
+        self.stack.set_visible_child_name(self.steps[self.idx])
+        self.btn_back.set_sensitive(self.idx > 0)
+        last = self.idx == len(self.steps) - 1
+        self.btn_next.set_label(t("start") if last else t("next"))
+
+    def error(self, text):
+        d = Gtk.MessageDialog(parent=self, flags=0, message_type=Gtk.MessageType.ERROR,
+                              buttons=Gtk.ButtonsType.CLOSE, text=t("error"))
+        d.format_secondary_text(text)
+        d.run()
+        d.destroy()
+
+    def go(self, delta):
+        cur = self.steps[self.idx]
+        if delta > 0:
+            if cur == "lang":
+                code = self.lang_combo.get_active_id()
+                if code != I.get_lang():
+                    I.apply_language(code)
+                    os.environ["KAMING_WELCOME_STEP"] = "1"
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+            if cur == "profile":
+                name, pw, pw2 = self.e_name.get_text().strip(), self.e_pw.get_text(), self.e_pw2.get_text()
+                if pw != pw2:
+                    self.error(t("pw_mismatch"))
+                    return
+                if name or pw:
+                    r = subprocess.run(["sudo", "-n", "/usr/local/sbin/kaming-live-profile"],
+                                       input=f"{name}\n{pw}\n", capture_output=True, text=True)
+                    if r.returncode != 0:
+                        self.error(r.stderr.strip() or "failed")
+                        return
+            if self.idx == len(self.steps) - 1:
+                os.makedirs(os.path.dirname(DONE), exist_ok=True)
+                open(DONE, "w").close()
+                self.destroy()
+                return
+        self.idx = max(0, min(len(self.steps) - 1, self.idx + delta))
+        self.update()
+
+
+def main():
+    if os.path.exists(DONE) and "--force" not in sys.argv:
+        return
+    step = int(os.environ.pop("KAMING_WELCOME_STEP", "0"))
+    w = Welcome(step)
+    w.connect("destroy", Gtk.main_quit)
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
+KAMING_EOF_6
+chmod 755 "config/includes.chroot/usr/local/bin/kaming-welcome"
+
+mkdir -p "$(dirname "config/includes.chroot/usr/local/bin/kaming-run-windows")"
+cat > "config/includes.chroot/usr/local/bin/kaming-run-windows" <<'KAMING_EOF_7'
+#!/bin/bash
+export WINEDEBUG=-all
+export WINEDLLOVERRIDES="mscoree,mshtml="   # не ждём скачивания Mono/Gecko
+case "${LANG%%_*}" in
+  ru) MSG="Подготовка среды Windows (только при первом запуске, это может занять несколько минут)…";;
+  uk) MSG="Підготовка середовища Windows (лише при першому запуску, може тривати кілька хвилин)…";;
+  zh) MSG="正在准备 Windows 环境（仅首次运行，可能需要几分钟）…";;
+  pl) MSG="Przygotowywanie środowiska Windows (tylko przy pierwszym uruchomieniu, to może potrwać kilka minut)…";;
+  *)  MSG="Preparing the Windows environment (first run only, may take a few minutes)…";;
+esac
+if [ ! -f "$HOME/.wine/system.reg" ]; then
+  ( wineboot -u >/dev/null 2>&1 ) | zenity --progress --pulsate --auto-close --no-cancel --title="Kaming OS" --text="$MSG"
+fi
+f="$1"
+[ -n "$f" ] || exit 0
+case "$f" in
+  *.msi|*.MSI) exec wine msiexec /i "$f" ;;
+  *) exec wine start /unix "$f" ;;
+esac
+KAMING_EOF_7
+chmod 755 "config/includes.chroot/usr/local/bin/kaming-run-windows"
+
+mkdir -p "$(dirname "config/includes.chroot/usr/local/bin/kaming-session-init")"
+cat > "config/includes.chroot/usr/local/bin/kaming-session-init" <<'KAMING_EOF_8'
+#!/bin/bash
+for d in Downloads Documents Pictures Music Videos Desktop; do mkdir -p "$HOME/$d"; done
+mkdir -p "$HOME/.config/gtk-3.0"
+B="$HOME/.config/gtk-3.0/bookmarks"
+for d in Downloads Documents Pictures; do
+  grep -q "file://$HOME/$d" "$B" 2>/dev/null || echo "file://$HOME/$d $d" >> "$B"
+done
+sleep 4
+pactl set-sink-mute @DEFAULT_SINK@ 0 2>/dev/null
+pactl set-sink-volume @DEFAULT_SINK@ 80% 2>/dev/null
+for c in Master Speaker Headphone PCM; do amixer -q sset "$c" unmute 2>/dev/null; done
+exit 0
+KAMING_EOF_8
+chmod 755 "config/includes.chroot/usr/local/bin/kaming-session-init"
+
+mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/autostart/kaming-session-init.desktop")"
+cat > "config/includes.chroot/etc/skel/.config/autostart/kaming-session-init.desktop" <<'KAMING_EOF_9'
+[Desktop Entry]
+Type=Application
+Name=Kaming session init
+Exec=kaming-session-init
+X-GNOME-Autostart-enabled=true
+KAMING_EOF_9
+chmod 644 "config/includes.chroot/etc/skel/.config/autostart/kaming-session-init.desktop"
+
+mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/autostart/kaming-welcome.desktop")"
+cat > "config/includes.chroot/etc/skel/.config/autostart/kaming-welcome.desktop" <<'KAMING_EOF_10'
+[Desktop Entry]
+Type=Application
+Name=Kaming Welcome
+Exec=kaming-welcome
+X-GNOME-Autostart-enabled=true
+KAMING_EOF_10
+chmod 644 "config/includes.chroot/etc/skel/.config/autostart/kaming-welcome.desktop"
+
+mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/user-dirs.dirs")"
+cat > "config/includes.chroot/etc/skel/.config/user-dirs.dirs" <<'KAMING_EOF_11'
+XDG_DESKTOP_DIR="$HOME/Desktop"
+XDG_DOWNLOAD_DIR="$HOME/Downloads"
+XDG_DOCUMENTS_DIR="$HOME/Documents"
+XDG_MUSIC_DIR="$HOME/Music"
+XDG_PICTURES_DIR="$HOME/Pictures"
+XDG_VIDEOS_DIR="$HOME/Videos"
+KAMING_EOF_11
+chmod 644 "config/includes.chroot/etc/skel/.config/user-dirs.dirs"
+
+mkdir -p "$(dirname "config/includes.chroot/usr/share/applications/kaming-downloads.desktop")"
+cat > "config/includes.chroot/usr/share/applications/kaming-downloads.desktop" <<'KAMING_EOF_12'
+[Desktop Entry]
+Type=Application
+Name=Downloads
+Name[ru]=Загрузки
+Name[uk]=Завантаження
+Name[zh_CN]=下载
+Name[pl]=Pobrane
+Exec=sh -c 'xdg-open "$(xdg-user-dir DOWNLOAD)"'
+Icon=folder-download
+Terminal=false
+Categories=Utility;
+KAMING_EOF_12
+chmod 644 "config/includes.chroot/usr/share/applications/kaming-downloads.desktop"
+
+mkdir -p "$(dirname "config/includes.chroot/usr/share/applications/kaming-welcome.desktop")"
+cat > "config/includes.chroot/usr/share/applications/kaming-welcome.desktop" <<'KAMING_EOF_13'
+[Desktop Entry]
+Type=Application
+Name=Kaming Welcome
+Exec=kaming-welcome --force
+Icon=help-about
+Terminal=false
+Categories=System;
+KAMING_EOF_13
+chmod 644 "config/includes.chroot/usr/share/applications/kaming-welcome.desktop"
+
 mkdir -p "$(dirname "config/includes.chroot/usr/share/applications/kaming-browser.desktop")"
-cat > "config/includes.chroot/usr/share/applications/kaming-browser.desktop" <<'KAMING_EOF_5'
+cat > "config/includes.chroot/usr/share/applications/kaming-browser.desktop" <<'KAMING_EOF_14'
 [Desktop Entry]
 Type=Application
 Name=Kaming Browser
@@ -1288,11 +1862,11 @@ Actions=private;
 [Desktop Action private]
 Name=New Private Window
 Exec=kaming-browser --private
-KAMING_EOF_5
+KAMING_EOF_14
 chmod 644 "config/includes.chroot/usr/share/applications/kaming-browser.desktop"
 
 mkdir -p "$(dirname "config/includes.chroot/usr/share/applications/kaming-settings.desktop")"
-cat > "config/includes.chroot/usr/share/applications/kaming-settings.desktop" <<'KAMING_EOF_6'
+cat > "config/includes.chroot/usr/share/applications/kaming-settings.desktop" <<'KAMING_EOF_15'
 [Desktop Entry]
 Type=Application
 Name=Kaming Settings
@@ -1304,33 +1878,33 @@ Exec=kaming-settings
 Icon=preferences-system
 Terminal=false
 Categories=Settings;System;
-KAMING_EOF_6
+KAMING_EOF_15
 chmod 644 "config/includes.chroot/usr/share/applications/kaming-settings.desktop"
 
 mkdir -p "$(dirname "config/includes.chroot/usr/share/applications/wine-exe.desktop")"
-cat > "config/includes.chroot/usr/share/applications/wine-exe.desktop" <<'KAMING_EOF_7'
+cat > "config/includes.chroot/usr/share/applications/wine-exe.desktop" <<'KAMING_EOF_16'
 [Desktop Entry]
 Type=Application
 Name=Windows Program (Wine)
-Exec=wine start /unix %f
+Exec=kaming-run-windows %f
 MimeType=application/x-ms-dos-executable;application/x-msdownload;application/vnd.microsoft.portable-executable;
 NoDisplay=true
-KAMING_EOF_7
+KAMING_EOF_16
 chmod 644 "config/includes.chroot/usr/share/applications/wine-exe.desktop"
 
 mkdir -p "$(dirname "config/includes.chroot/usr/share/applications/wine-msi.desktop")"
-cat > "config/includes.chroot/usr/share/applications/wine-msi.desktop" <<'KAMING_EOF_8'
+cat > "config/includes.chroot/usr/share/applications/wine-msi.desktop" <<'KAMING_EOF_17'
 [Desktop Entry]
 Type=Application
 Name=Windows Installer (Wine)
-Exec=wine msiexec /i %f
+Exec=kaming-run-windows %f
 MimeType=application/x-msi;
 NoDisplay=true
-KAMING_EOF_8
+KAMING_EOF_17
 chmod 644 "config/includes.chroot/usr/share/applications/wine-msi.desktop"
 
 mkdir -p "$(dirname "config/includes.chroot/etc/skel/Desktop/install-kaming-os.desktop")"
-cat > "config/includes.chroot/etc/skel/Desktop/install-kaming-os.desktop" <<'KAMING_EOF_9'
+cat > "config/includes.chroot/etc/skel/Desktop/install-kaming-os.desktop" <<'KAMING_EOF_18'
 [Desktop Entry]
 Type=Application
 Name=Install Kaming OS
@@ -1341,90 +1915,112 @@ Name[pl]=Zainstaluj Kaming OS
 Exec=sudo -E calamares
 Icon=system-software-install
 Terminal=false
-KAMING_EOF_9
+KAMING_EOF_18
 chmod 755 "config/includes.chroot/etc/skel/Desktop/install-kaming-os.desktop"
 
 mkdir -p "$(dirname "config/includes.chroot/etc/lightdm/lightdm.conf.d/50-kaming.conf")"
-cat > "config/includes.chroot/etc/lightdm/lightdm.conf.d/50-kaming.conf" <<'KAMING_EOF_10'
+cat > "config/includes.chroot/etc/lightdm/lightdm.conf.d/50-kaming.conf" <<'KAMING_EOF_19'
 [Seat:*]
 autologin-user=kaming
 autologin-user-timeout=0
 user-session=xfce
-KAMING_EOF_10
+greeter-session=lightdm-gtk-greeter
+KAMING_EOF_19
 chmod 644 "config/includes.chroot/etc/lightdm/lightdm.conf.d/50-kaming.conf"
 
+mkdir -p "$(dirname "config/includes.chroot/etc/lightdm/lightdm-gtk-greeter.conf")"
+cat > "config/includes.chroot/etc/lightdm/lightdm-gtk-greeter.conf" <<'KAMING_EOF_20'
+[greeter]
+background=/usr/share/backgrounds/kaming/Kaming-Blue.png
+theme-name=WhiteSur-Dark
+icon-theme-name=WhiteSur-dark
+font-name=Inter 11
+clock-format=%H:%M   %A, %d %B
+indicators=~host;~spacer;~clock;~spacer;~language;~session;~a11y;~power
+user-background=false
+position=50%,center
+KAMING_EOF_20
+chmod 644 "config/includes.chroot/etc/lightdm/lightdm-gtk-greeter.conf"
+
 mkdir -p "$(dirname "config/includes.chroot/etc/os-release")"
-cat > "config/includes.chroot/etc/os-release" <<'KAMING_EOF_11'
-PRETTY_NAME="Kaming OS 1.1"
+cat > "config/includes.chroot/etc/os-release" <<'KAMING_EOF_21'
+PRETTY_NAME="Kaming OS 1.2"
 NAME="Kaming OS"
-VERSION="1.1"
+VERSION="1.2"
 ID=kamingos
 ID_LIKE=debian
 HOME_URL="https://example.com"
-KAMING_EOF_11
+KAMING_EOF_21
 chmod 644 "config/includes.chroot/etc/os-release"
 
 mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/autostart/plank.desktop")"
-cat > "config/includes.chroot/etc/skel/.config/autostart/plank.desktop" <<'KAMING_EOF_12'
+cat > "config/includes.chroot/etc/skel/.config/autostart/plank.desktop" <<'KAMING_EOF_22'
 [Desktop Entry]
 Type=Application
 Name=Dock
 Exec=plank
 X-GNOME-Autostart-enabled=true
-KAMING_EOF_12
+KAMING_EOF_22
 chmod 644 "config/includes.chroot/etc/skel/.config/autostart/plank.desktop"
 
 mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/10-browser.dockitem")"
-cat > "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/10-browser.dockitem" <<'KAMING_EOF_13'
+cat > "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/10-browser.dockitem" <<'KAMING_EOF_23'
 [PlankDockItemPreferences]
 Launcher=file:///usr/share/applications/kaming-browser.desktop
-KAMING_EOF_13
+KAMING_EOF_23
 chmod 644 "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/10-browser.dockitem"
 
 mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/20-files.dockitem")"
-cat > "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/20-files.dockitem" <<'KAMING_EOF_14'
+cat > "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/20-files.dockitem" <<'KAMING_EOF_24'
 [PlankDockItemPreferences]
 Launcher=file:///usr/share/applications/thunar.desktop
-KAMING_EOF_14
+KAMING_EOF_24
 chmod 644 "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/20-files.dockitem"
 
+mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/25-downloads.dockitem")"
+cat > "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/25-downloads.dockitem" <<'KAMING_EOF_25'
+[PlankDockItemPreferences]
+Launcher=file:///usr/share/applications/kaming-downloads.desktop
+KAMING_EOF_25
+chmod 644 "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/25-downloads.dockitem"
+
 mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/30-settings.dockitem")"
-cat > "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/30-settings.dockitem" <<'KAMING_EOF_15'
+cat > "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/30-settings.dockitem" <<'KAMING_EOF_26'
 [PlankDockItemPreferences]
 Launcher=file:///usr/share/applications/kaming-settings.desktop
-KAMING_EOF_15
+KAMING_EOF_26
 chmod 644 "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/30-settings.dockitem"
 
 mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/40-calculator.dockitem")"
-cat > "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/40-calculator.dockitem" <<'KAMING_EOF_16'
+cat > "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/40-calculator.dockitem" <<'KAMING_EOF_27'
 [PlankDockItemPreferences]
 Launcher=file:///usr/share/applications/galculator.desktop
-KAMING_EOF_16
+KAMING_EOF_27
 chmod 644 "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/40-calculator.dockitem"
 
 mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/50-editor.dockitem")"
-cat > "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/50-editor.dockitem" <<'KAMING_EOF_17'
+cat > "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/50-editor.dockitem" <<'KAMING_EOF_28'
 [PlankDockItemPreferences]
 Launcher=file:///usr/share/applications/org.xfce.mousepad.desktop
-KAMING_EOF_17
+KAMING_EOF_28
 chmod 644 "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/50-editor.dockitem"
 
 mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/60-terminal.dockitem")"
-cat > "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/60-terminal.dockitem" <<'KAMING_EOF_18'
+cat > "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/60-terminal.dockitem" <<'KAMING_EOF_29'
 [PlankDockItemPreferences]
 Launcher=file:///usr/share/applications/xfce4-terminal.desktop
-KAMING_EOF_18
+KAMING_EOF_29
 chmod 644 "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/60-terminal.dockitem"
 
 mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/70-firefox.dockitem")"
-cat > "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/70-firefox.dockitem" <<'KAMING_EOF_19'
+cat > "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/70-firefox.dockitem" <<'KAMING_EOF_30'
 [PlankDockItemPreferences]
 Launcher=file:///usr/share/applications/firefox-esr.desktop
-KAMING_EOF_19
+KAMING_EOF_30
 chmod 644 "config/includes.chroot/etc/skel/.config/plank/dock1/launchers/70-firefox.dockitem"
 
 mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml")"
-cat > "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" <<'KAMING_EOF_20'
+cat > "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml" <<'KAMING_EOF_31'
 <?xml version="1.0" encoding="UTF-8"?>
 <channel name="xsettings" version="1.0">
   <property name="Net" type="empty">
@@ -1442,11 +2038,11 @@ cat > "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/
     <property name="RGBA" type="string" value="rgb"/>
   </property>
 </channel>
-KAMING_EOF_20
+KAMING_EOF_31
 chmod 644 "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml"
 
 mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml")"
-cat > "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" <<'KAMING_EOF_21'
+cat > "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" <<'KAMING_EOF_32'
 <?xml version="1.0" encoding="UTF-8"?>
 <channel name="xfwm4" version="1.0">
   <property name="general" type="empty">
@@ -1458,11 +2054,11 @@ cat > "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/
     <property name="show_frame_shadow" type="bool" value="false"/>
   </property>
 </channel>
-KAMING_EOF_21
+KAMING_EOF_32
 chmod 644 "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml"
 
 mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml")"
-cat > "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml" <<'KAMING_EOF_22'
+cat > "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml" <<'KAMING_EOF_33'
 <?xml version="1.0" encoding="UTF-8"?>
 <channel name="xfce4-desktop" version="1.0">
   <property name="backdrop" type="empty">
@@ -1482,11 +2078,53 @@ cat > "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/
     </property>
   </property>
 </channel>
-KAMING_EOF_22
+KAMING_EOF_33
 chmod 644 "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml"
 
+mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml")"
+cat > "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml" <<'KAMING_EOF_34'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-panel" version="1.0">
+  <property name="configver" type="int" value="2"/>
+  <property name="panels" type="array">
+    <value type="int" value="1"/>
+    <property name="dark-mode" type="bool" value="false"/>
+    <property name="panel-1" type="empty">
+      <property name="position" type="string" value="p=6;x=0;y=0"/>
+      <property name="length" type="uint" value="100"/>
+      <property name="position-locked" type="bool" value="true"/>
+      <property name="size" type="uint" value="28"/>
+      <property name="plugin-ids" type="array">
+        <value type="int" value="1"/>
+        <value type="int" value="2"/>
+        <value type="int" value="3"/>
+        <value type="int" value="4"/>
+        <value type="int" value="5"/>
+        <value type="int" value="6"/>
+        <value type="int" value="7"/>
+        <value type="int" value="8"/>
+      </property>
+    </property>
+  </property>
+  <property name="plugins" type="empty">
+    <property name="plugin-1" type="string" value="applicationsmenu"/>
+    <property name="plugin-2" type="string" value="separator">
+      <property name="expand" type="bool" value="true"/>
+      <property name="style" type="uint" value="0"/>
+    </property>
+    <property name="plugin-3" type="string" value="systray"/>
+    <property name="plugin-4" type="string" value="statusnotifier"/>
+    <property name="plugin-5" type="string" value="pulseaudio"/>
+    <property name="plugin-6" type="string" value="power-manager-plugin"/>
+    <property name="plugin-7" type="string" value="clock"/>
+    <property name="plugin-8" type="string" value="actions"/>
+  </property>
+</channel>
+KAMING_EOF_34
+chmod 644 "config/includes.chroot/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+
 mkdir -p "$(dirname "config/includes.chroot/etc/skel/.config/mimeapps.list")"
-cat > "config/includes.chroot/etc/skel/.config/mimeapps.list" <<'KAMING_EOF_23'
+cat > "config/includes.chroot/etc/skel/.config/mimeapps.list" <<'KAMING_EOF_35'
 [Default Applications]
 application/x-ms-dos-executable=wine-exe.desktop
 application/x-msdownload=wine-exe.desktop
@@ -1495,11 +2133,11 @@ application/x-msi=wine-msi.desktop
 text/html=kaming-browser.desktop
 x-scheme-handler/http=kaming-browser.desktop
 x-scheme-handler/https=kaming-browser.desktop
-KAMING_EOF_23
+KAMING_EOF_35
 chmod 644 "config/includes.chroot/etc/skel/.config/mimeapps.list"
 
 mkdir -p "$(dirname "config/hooks/live/0100-kaming.hook.chroot")"
-cat > "config/hooks/live/0100-kaming.hook.chroot" <<'KAMING_EOF_24'
+cat > "config/hooks/live/0100-kaming.hook.chroot" <<'KAMING_EOF_36'
 #!/bin/bash
 set -x
 export DEBIAN_FRONTEND=noninteractive
@@ -1540,8 +2178,11 @@ mk -size 2560x1440 gradient:'#ee9ca7-#ffdde1'          "$W/Rose.png"       || tr
 mk -size 2560x1440 gradient:'#232526-#414345'          "$W/Graphite.png"   || true
 
 # 5) Права и браузер по умолчанию
-chmod +x /usr/local/bin/kaming-browser /usr/local/bin/kaming-settings /usr/local/sbin/kaming-set-locale
+chmod +x /usr/local/bin/kaming-browser /usr/local/bin/kaming-settings /usr/local/bin/kaming-welcome \
+  /usr/local/bin/kaming-run-windows /usr/local/bin/kaming-session-init \
+  /usr/local/sbin/kaming-set-locale /usr/local/sbin/kaming-live-profile
 chmod 0440 /etc/sudoers.d/kaming-settings
+mkdir -p /etc/skel/Downloads /etc/skel/Documents /etc/skel/Pictures /etc/skel/Music /etc/skel/Videos /etc/skel/Desktop
 update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/local/bin/kaming-browser 200 || true
 update-alternatives --install /usr/bin/gnome-www-browser gnome-www-browser /usr/local/bin/kaming-browser 200 || true
 update-desktop-database /usr/share/applications || true
@@ -1554,11 +2195,11 @@ echo "kaming:live" | chpasswd
 mkdir -p /home/kaming
 cp -rT /etc/skel /home/kaming
 chown -R kaming:kaming /home/kaming
-KAMING_EOF_24
+KAMING_EOF_36
 chmod 755 "config/hooks/live/0100-kaming.hook.chroot"
 
 mkdir -p "$(dirname "config/package-lists/kaming.list.chroot")"
-cat > "config/package-lists/kaming.list.chroot" <<'KAMING_EOF_25'
+cat > "config/package-lists/kaming.list.chroot" <<'KAMING_EOF_37'
 # Рабочий стол
 xfce4
 xfce4-goodies
@@ -1577,6 +2218,18 @@ x11-xserver-utils
 x11-xkb-utils
 libnotify-bin
 zram-tools
+# Звук, блокировка экрана, папки
+alsa-utils
+pulseaudio-utils
+xfce4-pulseaudio-plugin
+xfce4-statusnotifier-plugin
+light-locker
+xserver-xorg-core
+xdg-user-dirs
+xdg-user-dirs-gtk
+gstreamer1.0-plugins-good
+gstreamer1.0-plugins-bad
+gstreamer1.0-libav
 # Тема и шрифты
 fonts-inter
 fonts-noto
@@ -1631,9 +2284,24 @@ firmware-misc-nonfree
 firmware-iwlwifi
 firmware-realtek
 firmware-atheros
-KAMING_EOF_25
+KAMING_EOF_37
 chmod 644 "config/package-lists/kaming.list.chroot"
 
+
+echo "==> Проверка списка пакетов по индексу Debian (переименованные пакеты не ломают сборку)"
+: > /tmp/debian-packages.txt
+for comp in main contrib non-free non-free-firmware; do
+  curl -fsSL "https://deb.debian.org/debian/dists/trixie/${comp}/binary-amd64/Packages.xz" \
+    | xz -dc | grep '^Package: ' | cut -d' ' -f2 >> /tmp/debian-packages.txt || true
+done
+if [ "$(wc -l < /tmp/debian-packages.txt)" -gt 10000 ]; then
+  for f in config/package-lists/*.list.chroot; do
+    grep -v '^#' "$f" | grep -v '^$' | while read -r p; do
+      if grep -qxF "$p" /tmp/debian-packages.txt; then echo "$p"; else echo "!! пакет пропущен (нет в trixie): $p" >&2; fi
+    done > "$f.tmp"
+    mv "$f.tmp" "$f"
+  done
+fi
 
 echo "==> Сборка ISO (это долго, 20-60 минут)"
 lb build 2>&1 | tee build.log
